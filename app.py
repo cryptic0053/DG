@@ -12,8 +12,10 @@ from flask import Flask, request, jsonify, render_template_string
 # ---------------- CONFIG ----------------
 MODEL_PATH = os.environ.get("MODEL_PATH", "model.tflite")  # commit this file or provide MODEL_URL
 MODEL_URL  = os.environ.get("MODEL_URL")                   # direct URL to model.tflite (optional)
-IMG_SIZE   = (224, 224)    # must match training input
-RESCALE    = 1.0           # must match training preprocessing
+IMG_SIZE   = (224, 224)                                    # must match training input
+# If your model graph already has a Rescaling(1./255) layer, keep 1.0 here.
+# If it does NOT, set RESCALE=1/255.0. We also auto-handle uint8 quantized inputs below.
+RESCALE    = float(os.environ.get("RESCALE", "1.0"))
 CLASS_NAMES = [
     "Bacterial_dermatosis",
     "Dermatitis",
@@ -53,8 +55,7 @@ def ensure_model_file() -> bool:
         print("Model download failed:", repr(e))
         return False
 
-# Try to ensure it at boot, but don't crash if missing (health will report it)
-ensure_model_file()
+ensure_model_file()  # don't crash at boot if missing (health will report)
 
 # --------- Lazy TFLite interpreter (thread-safe) ----------
 _interpreter = None
@@ -63,10 +64,7 @@ _out_det = None
 _interp_lock = threading.Lock()
 
 def get_interpreter():
-    """
-    Lazily create the TFLite interpreter and cache input/output details.
-    Use a lock because TFLite isn't thread-safe.
-    """
+    """Lazily create the TFLite interpreter and cache input/output details."""
     global _interpreter, _in_det, _out_det
     if _interpreter is not None:
         return _interpreter, _in_det, _out_det
@@ -78,43 +76,124 @@ def get_interpreter():
         if _interpreter is None:
             itp = tflite.Interpreter(model_path=MODEL_PATH, num_threads=NUM_THREADS)
             itp.allocate_tensors()
-            _in = itp.get_input_details()[0]   # assume single input
-            _out = itp.get_output_details()[0] # assume first output is logits/probs
+            _in = itp.get_input_details()[0]    # assume single input
+            _out = itp.get_output_details()[0]  # assume first output is logits/probs
             _interpreter, _in_det, _out_det = itp, _in, _out
-
     return _interpreter, _in_det, _out_det
 
 # --------------- Helpers ----------------
 def preprocess_image(file_bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     img = img.resize(IMG_SIZE)
-    x = np.asarray(img, dtype=np.float32) * RESCALE
+    x = np.asarray(img, dtype=np.float32) * RESCALE  # if model has Rescaling layer, keep RESCALE=1.0
     x = np.expand_dims(x, axis=0)  # [1, H, W, C]
     return img, x
 
+def _is_quantized(tensor_detail):
+    # TFLite quantization info: (scale, zero_point); scale==0 means not quantized
+    qparams = tensor_detail.get("quantization_parameters", {})
+    scales = qparams.get("scales", [])
+    zero_points = qparams.get("zero_points", [])
+    if len(scales) == 0:  # sometimes it's stored under 'quantization'
+        scale, zp = tensor_detail.get("quantization", (0.0, 0))
+        return scale not in (None, 0.0)
+    return (len(scales) > 0) and any(s != 0.0 for s in scales)
+
+def _get_qparams(tensor_detail):
+    q = tensor_detail.get("quantization_parameters", {})
+    scales = q.get("scales", [])
+    zero_points = q.get("zero_points", [])
+    if len(scales) == 0:
+        # fallback
+        scale, zp = tensor_detail.get("quantization", (0.0, 0))
+        return float(scale or 0.0), int(zp or 0)
+    return float(scales[0]), int(zero_points[0] if zero_points else 0)
+
+def _maybe_softmax(v):
+    v = np.asarray(v, dtype=np.float32)
+    # If already probabilities (sum≈1 and values in [0,1]), keep as-is.
+    s = float(v.sum())
+    if 0.98 <= s <= 1.02 and np.all(v >= -1e-6) and np.all(v <= 1.0 + 1e-6):
+        return v
+    # Otherwise treat as logits
+    e = np.exp(v - np.max(v))
+    return e / np.sum(e)
+
 def predict_probs(x_batch):
     itp, in_det, out_det = get_interpreter()
-    xin = x_batch.astype(in_det["dtype"])
+
+    # Handle input dtype / quantization
+    xin = x_batch
+    if in_det["dtype"] == np.uint8 or _is_quantized(in_det):
+        # Quantized input: map float to uint8 using scale/zero_point
+        scale, zp = _get_qparams(in_det)
+        if scale == 0.0:
+            # fallback: clip to [0,255]
+            q = np.clip(xin, 0, 255).astype(np.uint8)
+        else:
+            q = np.round(xin / scale + zp)
+            q = np.clip(q, 0, 255).astype(np.uint8)
+        xin = q
+    else:
+        xin = xin.astype(in_det["dtype"])
+
     with _interp_lock:
         itp.set_tensor(in_det["index"], xin)
         itp.invoke()
-        preds = itp.get_tensor(out_det["index"])  # [1, num_classes]
-    preds = preds[0].astype(float)
+        preds = itp.get_tensor(out_det["index"])[0]  # [num_classes] typically
 
-    # If your model outputs logits, uncomment to apply softmax:
-    # e = np.exp(preds - np.max(preds))
-    # preds = e / np.sum(e)
+    # Handle output dtype / quantization
+    if (out_det["dtype"] == np.uint8) or _is_quantized(out_det):
+        scale, zp = _get_qparams(out_det)
+        preds = (preds.astype(np.float32) - zp) * (scale if scale else 1.0)
+    else:
+        preds = preds.astype(np.float32)
+
+    # Convert logits → probabilities if needed
+    preds = _maybe_softmax(preds)
 
     return preds
 # ----------------------------------------
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "status": "ok" if os.path.exists(MODEL_PATH) else "missing_model",
-        "model_path": MODEL_PATH,
-        "gradcam": GRADCAM_ENABLED
-    })
+    try:
+        _, in_det, out_det = get_interpreter()
+        info = {
+            "status": "ok" if os.path.exists(MODEL_PATH) else "missing_model",
+            "model_path": MODEL_PATH,
+            "gradcam": GRADCAM_ENABLED,
+            "input_dtype": str(in_det["dtype"]),
+            "input_shape": list(in_det["shape"]),
+            "input_quantized": _is_quantized(in_det),
+            "output_dtype": str(out_det["dtype"]),
+            "output_shape": list(out_det["shape"]),
+            "output_quantized": _is_quantized(out_det),
+        }
+    except Exception as e:
+        info = {"status": "error", "detail": str(e), "model_path": MODEL_PATH}
+    return jsonify(info)
+
+def _format_response(probs):
+    # safety against totally flat vectors
+    if probs.size != len(CLASS_NAMES):
+        return jsonify({
+            "error": "Class count mismatch",
+            "model_logits": int(probs.size),
+            "class_names": int(len(CLASS_NAMES))
+        }), 500
+
+    std = float(np.std(probs))
+    if std < 1e-6:
+        return jsonify({
+            "error": "Model returned a near-uniform vector",
+            "detail": "Check that correct weights are in the TFLite model and preprocessing matches training.",
+        }), 500
+
+    top_idx = np.argsort(probs)[::-1][:TOP_K]
+    top = [{"class": CLASS_NAMES[i], "prob": round(float(probs[i]), 6)} for i in top_idx]
+    full = {CLASS_NAMES[i]: round(float(probs[i]), 6) for i in range(len(CLASS_NAMES))}
+    return jsonify({"predicted": top[0]["class"], "top_k": top, "probs": full})
 
 @app.post("/predict")
 def predict():
@@ -127,25 +206,13 @@ def predict():
 
         _, x = preprocess_image(f.read())
         probs = predict_probs(x)
-
-        if len(probs) != len(CLASS_NAMES):
-            return jsonify({
-                "error": "Class count mismatch",
-                "model_logits": int(len(probs)),
-                "class_names": int(len(CLASS_NAMES))
-            }), 500
-
-        top_idx = np.argsort(probs)[::-1][:TOP_K]
-        top = [{"class": CLASS_NAMES[i], "prob": round(float(probs[i]), 6)} for i in top_idx]
-        full = {CLASS_NAMES[i]: round(float(probs[i]), 6) for i in range(len(CLASS_NAMES))}
-        return jsonify({"predicted": top[0]["class"], "top_k": top, "probs": full})
+        return _format_response(probs)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": "Internal error", "detail": str(e)}), 500
 
 @app.post("/predict_with_gradcam")
 def predict_with_gradcam():
-    # Same as /predict, but keeps a 'gradcam_png_base64' key (None for TFLite).
     try:
         if "file" not in request.files:
             return jsonify({"error": "No file part; send multipart/form-data with 'file'"}), 400
@@ -155,24 +222,13 @@ def predict_with_gradcam():
 
         _, x = preprocess_image(f.read())
         probs = predict_probs(x)
-
-        if len(probs) != len(CLASS_NAMES):
-            return jsonify({
-                "error": "Class count mismatch",
-                "model_logits": int(len(probs)),
-                "class_names": int(len(CLASS_NAMES))
-            }), 500
-
-        top_idx = np.argsort(probs)[::-1][:TOP_K]
-        top = [{"class": CLASS_NAMES[i], "prob": round(float(probs[i]), 6)} for i in top_idx]
-        full = {CLASS_NAMES[i]: round(float(probs[i]), 6) for i in range(len(CLASS_NAMES))}
-
-        return jsonify({
-            "predicted": top[0]["class"],
-            "top_k": top,
-            "probs": full,
-            "gradcam_png_base64": None  # not available on TFLite
-        })
+        base = _format_response(probs)
+        # _format_response returns a Response or tuple; unwrap for adding key
+        if isinstance(base, tuple):  # error path
+            return base
+        data = base.get_json()
+        data["gradcam_png_base64"] = None
+        return jsonify(data)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": "Internal error", "detail": str(e)}), 500
@@ -220,18 +276,6 @@ def index():
           <pre id="probs"></pre>
         </details>
       </div>
-
-      {% if gradcam %}
-      <div style="margin-top:16px;">
-        <label class="muted">Optional: pick a class for Grad-CAM</label><br/>
-        <select id="classSelect"></select>
-        <button id="btnCam" style="margin-left:8px;">Make Grad-CAM</button>
-      </div>
-      {% else %}
-      <div class="muted" style="margin-top:16px;">
-        Grad-CAM is disabled on the Render deployment (TFLite build).
-      </div>
-      {% endif %}
     </div>
 
     <div class="card">
@@ -272,6 +316,8 @@ form.addEventListener('submit', async (e)=>{
   const js = await res.json();
   statusEl.textContent = '';
 
+  if (js.error) { statusEl.textContent = js.error; return; }
+
   klist.innerHTML = '';
   js.top_k.forEach(t => {
     const wrap = document.createElement('div'); wrap.style.margin = '6px 0';
@@ -292,6 +338,5 @@ form.addEventListener('submit', async (e)=>{
 """, class_names=CLASS_NAMES, gradcam=GRADCAM_ENABLED)
 
 if __name__ == "__main__":
-    # local dev (Render will use gunicorn)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

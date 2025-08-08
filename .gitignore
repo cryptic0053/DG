@@ -10,6 +10,7 @@ __pycache__/
 venv/
 env/
 tf210/
+tf219/
 
 # VS Code
 .vscode/

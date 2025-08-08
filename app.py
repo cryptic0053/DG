@@ -13,7 +13,7 @@ from keras.utils import img_to_array
 import tensorflow as tf
 
 # ---------- CONFIG ----------
-MODEL_PATH = os.environ.get("MODEL_PATH", "model.h5")
+MODEL_PATH = os.environ.get("MODEL_PATH", "dog_disease_detector.h5")
 IMG_SIZE   = (224, 224)    # must match training
 RESCALE    = 1.0   # must match training
 CLASS_NAMES = [

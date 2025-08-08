@@ -1,0 +1,9 @@
+flask==3.0.3
+flask-cors==4.0.1
+tensorflow==2.19.0
+keras==3.5.0
+numpy==1.26.4
+pillow==11.3.0
+waitress==3.0.2
+h5py==3.14.0
+tensorboard~=2.19.0

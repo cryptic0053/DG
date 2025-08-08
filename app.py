@@ -10,11 +10,11 @@ from PIL import Image
 from flask import Flask, request, jsonify, render_template_string
 
 # ---------------- CONFIG ----------------
-MODEL_PATH = os.environ.get("MODEL_PATH", "model.tflite")  # commit this file or provide MODEL_URL
-MODEL_URL  = os.environ.get("MODEL_URL")                   # direct URL to model.tflite (optional)
-IMG_SIZE   = (224, 224)                                    # must match training input
-# If your model graph already has a Rescaling(1./255) layer, keep 1.0 here.
-# If it does NOT, set RESCALE=1/255.0. We also auto-handle uint8 quantized inputs below.
+MODEL_PATH = os.environ.get("MODEL_PATH", "model.tflite")  # commit this or provide MODEL_URL
+MODEL_URL  = os.environ.get("MODEL_URL")                   # optional direct URL to model.tflite
+IMG_SIZE   = (224, 224)                                    # must match training
+# If your model graph already includes a Rescaling(1./255) layer, keep RESCALE=1.0.
+# If not, set RESCALE=1/255.0 (or set an env var on Render).
 RESCALE    = float(os.environ.get("RESCALE", "1.0"))
 CLASS_NAMES = [
     "Bacterial_dermatosis",
@@ -93,29 +93,25 @@ def _is_quantized(tensor_detail):
     # TFLite quantization info: (scale, zero_point); scale==0 means not quantized
     qparams = tensor_detail.get("quantization_parameters", {})
     scales = qparams.get("scales", [])
-    zero_points = qparams.get("zero_points", [])
-    if len(scales) == 0:  # sometimes it's stored under 'quantization'
-        scale, zp = tensor_detail.get("quantization", (0.0, 0))
-        return scale not in (None, 0.0)
-    return (len(scales) > 0) and any(s != 0.0 for s in scales)
+    if len(scales) == 0:
+        scale, _ = tensor_detail.get("quantization", (0.0, 0))
+        return bool(scale)
+    return any(float(s) != 0.0 for s in scales)
 
 def _get_qparams(tensor_detail):
     q = tensor_detail.get("quantization_parameters", {})
     scales = q.get("scales", [])
     zero_points = q.get("zero_points", [])
     if len(scales) == 0:
-        # fallback
         scale, zp = tensor_detail.get("quantization", (0.0, 0))
         return float(scale or 0.0), int(zp or 0)
-    return float(scales[0]), int(zero_points[0] if zero_points else 0)
+    return float(scales[0]), int((zero_points[0] if zero_points else 0))
 
 def _maybe_softmax(v):
     v = np.asarray(v, dtype=np.float32)
-    # If already probabilities (sum≈1 and values in [0,1]), keep as-is.
     s = float(v.sum())
     if 0.98 <= s <= 1.02 and np.all(v >= -1e-6) and np.all(v <= 1.0 + 1e-6):
-        return v
-    # Otherwise treat as logits
+        return v  # already probs
     e = np.exp(v - np.max(v))
     return e / np.sum(e)
 
@@ -125,10 +121,9 @@ def predict_probs(x_batch):
     # Handle input dtype / quantization
     xin = x_batch
     if in_det["dtype"] == np.uint8 or _is_quantized(in_det):
-        # Quantized input: map float to uint8 using scale/zero_point
+        # Map float -> uint8 using scale/zero_point
         scale, zp = _get_qparams(in_det)
         if scale == 0.0:
-            # fallback: clip to [0,255]
             q = np.clip(xin, 0, 255).astype(np.uint8)
         else:
             q = np.round(xin / scale + zp)
@@ -140,7 +135,7 @@ def predict_probs(x_batch):
     with _interp_lock:
         itp.set_tensor(in_det["index"], xin)
         itp.invoke()
-        preds = itp.get_tensor(out_det["index"])[0]  # [num_classes] typically
+        preds = itp.get_tensor(out_det["index"])[0]  # [num_classes]
 
     # Handle output dtype / quantization
     if (out_det["dtype"] == np.uint8) or _is_quantized(out_det):
@@ -149,33 +144,17 @@ def predict_probs(x_batch):
     else:
         preds = preds.astype(np.float32)
 
-    # Convert logits → probabilities if needed
     preds = _maybe_softmax(preds)
 
-    return preds
-# ----------------------------------------
-
-@app.get("/health")
-def health():
+    # DEBUG (visible in Render logs): sum/std to catch flat vectors
     try:
-        _, in_det, out_det = get_interpreter()
-        info = {
-            "status": "ok" if os.path.exists(MODEL_PATH) else "missing_model",
-            "model_path": MODEL_PATH,
-            "gradcam": GRADCAM_ENABLED,
-            "input_dtype": str(in_det["dtype"]),
-            "input_shape": list(in_det["shape"]),
-            "input_quantized": _is_quantized(in_det),
-            "output_dtype": str(out_det["dtype"]),
-            "output_shape": list(out_det["shape"]),
-            "output_quantized": _is_quantized(out_det),
-        }
-    except Exception as e:
-        info = {"status": "error", "detail": str(e), "model_path": MODEL_PATH}
-    return jsonify(info)
+        print(f"[DEBUG] preds sum={float(preds.sum()):.6f} std={float(np.std(preds)):.6g}")
+    except Exception:
+        pass
+
+    return preds
 
 def _format_response(probs):
-    # safety against totally flat vectors
     if probs.size != len(CLASS_NAMES):
         return jsonify({
             "error": "Class count mismatch",
@@ -184,16 +163,46 @@ def _format_response(probs):
         }), 500
 
     std = float(np.std(probs))
+    warn = None
     if std < 1e-6:
-        return jsonify({
-            "error": "Model returned a near-uniform vector",
-            "detail": "Check that correct weights are in the TFLite model and preprocessing matches training.",
-        }), 500
+        warn = "Model returned a near-uniform vector; check weights/preprocessing."
 
     top_idx = np.argsort(probs)[::-1][:TOP_K]
     top = [{"class": CLASS_NAMES[i], "prob": round(float(probs[i]), 6)} for i in top_idx]
     full = {CLASS_NAMES[i]: round(float(probs[i]), 6) for i in range(len(CLASS_NAMES))}
-    return jsonify({"predicted": top[0]["class"], "top_k": top, "probs": full})
+    payload = {"predicted": top[0]["class"], "top_k": top, "probs": full}
+    if warn:
+        payload["warning"] = warn
+    return jsonify(payload)
+
+# ----------------------------------------
+
+@app.get("/health")
+def health():
+    # Never fail here; always return 200 with diagnostic info.
+    info = {
+        "model_path": MODEL_PATH,
+        "gradcam": GRADCAM_ENABLED,
+        "status": "missing_model" if not os.path.exists(MODEL_PATH) else "present",
+    }
+    if not os.path.exists(MODEL_PATH):
+        return jsonify(info), 200
+
+    try:
+        itp, in_det, out_det = get_interpreter()
+        info.update({
+            "status": "ok",
+            "input_dtype": str(in_det.get("dtype")),
+            "input_shape": [int(x) for x in list(in_det.get("shape", []))],
+            "input_quantized": bool(_is_quantized(in_det)),
+            "output_dtype": str(out_det.get("dtype")),
+            "output_shape": [int(x) for x in list(out_det.get("shape", []))],
+            "output_quantized": bool(_is_quantized(out_det)),
+            "rescale": RESCALE,
+        })
+    except Exception as e:
+        info.update({"status": "error_opening_model", "detail": str(e)})
+    return jsonify(info), 200
 
 @app.post("/predict")
 def predict():
@@ -223,7 +232,6 @@ def predict_with_gradcam():
         _, x = preprocess_image(f.read())
         probs = predict_probs(x)
         base = _format_response(probs)
-        # _format_response returns a Response or tuple; unwrap for adding key
         if isinstance(base, tuple):  # error path
             return base
         data = base.get_json()
@@ -258,7 +266,7 @@ def index():
   </style>
 </head>
 <body>
-  <h2>Dog Skin Disease — Predictor{% if gradcam %} + Grad-CAM{% endif %}</h2>
+  <h2>Dog Skin Disease — Predictor</h2>
 
   <div class="row">
     <div class="card">
@@ -335,7 +343,7 @@ form.addEventListener('submit', async (e)=>{
 </script>
 </body>
 </html>
-""", class_names=CLASS_NAMES, gradcam=GRADCAM_ENABLED)
+""")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

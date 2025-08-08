@@ -2,18 +2,18 @@ import os
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 import io
-import base64
 import urllib.request
 import traceback
+import threading
 import numpy as np
 from PIL import Image
-from flask import Flask, request, jsonify, render_template_string, send_file
+from flask import Flask, request, jsonify, render_template_string
 
 # ---------------- CONFIG ----------------
-MODEL_PATH = os.environ.get("MODEL_PATH", "model.tflite")  # put model.tflite in repo, or set MODEL_URL
-MODEL_URL  = os.environ.get("MODEL_URL")                   # direct link to model.tflite if not in repo
-IMG_SIZE   = (224, 224)    # must match training
-RESCALE    = 1.0           # must match training (your .h5 had 1.0)
+MODEL_PATH = os.environ.get("MODEL_PATH", "model.tflite")  # commit this file or provide MODEL_URL
+MODEL_URL  = os.environ.get("MODEL_URL")                   # direct URL to model.tflite (optional)
+IMG_SIZE   = (224, 224)    # must match training input
+RESCALE    = 1.0           # must match training preprocessing
 CLASS_NAMES = [
     "Bacterial_dermatosis",
     "Dermatitis",
@@ -24,18 +24,19 @@ CLASS_NAMES = [
     "ringworm",
 ]
 TOP_K = 3
-GRADCAM_ENABLED = False  # TFLite cannot compute gradients
+GRADCAM_ENABLED = False  # TFLite can't do gradients
+NUM_THREADS = int(os.environ.get("NUM_THREADS", "1"))
 # ----------------------------------------
 
-# tflite-runtime is much lighter than full TF
+# Lightweight TF runtime
 import tflite_runtime.interpreter as tflite
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8MB upload cap
 
-
+# --------- Model file presence (optional download) ----------
 def ensure_model_file() -> bool:
-    """Ensure MODEL_PATH exists; otherwise try downloading from MODEL_URL (raw file URL)."""
+    """Ensure MODEL_PATH exists; otherwise try downloading from MODEL_URL."""
     if os.path.exists(MODEL_PATH):
         return True
     if not MODEL_URL:
@@ -52,20 +53,38 @@ def ensure_model_file() -> bool:
         print("Model download failed:", repr(e))
         return False
 
+# Try to ensure it at boot, but don't crash if missing (health will report it)
+ensure_model_file()
 
-if not ensure_model_file():
-    # The app will still boot so you can hit /health and see the error
-    print("WARNING: model file missing:", MODEL_PATH)
+# --------- Lazy TFLite interpreter (thread-safe) ----------
+_interpreter = None
+_in_det = None
+_out_det = None
+_interp_lock = threading.Lock()
 
-# ---- Load TFLite model ----
-interpreter = tflite.Interpreter(model_path=MODEL_PATH, num_threads=int(os.environ.get("NUM_THREADS", "1")))
-interpreter.allocate_tensors()
-_in = interpreter.get_input_details()[0]   # assume single input
-_outs = interpreter.get_output_details()
-_out = _outs[0]                            # assume first output is probs/logits
+def get_interpreter():
+    """
+    Lazily create the TFLite interpreter and cache input/output details.
+    Use a lock because TFLite isn't thread-safe.
+    """
+    global _interpreter, _in_det, _out_det
+    if _interpreter is not None:
+        return _interpreter, _in_det, _out_det
 
+    if not os.path.exists(MODEL_PATH):
+        raise RuntimeError(f"Model not found at {MODEL_PATH}")
 
-# ---------- Helpers ----------
+    with _interp_lock:
+        if _interpreter is None:
+            itp = tflite.Interpreter(model_path=MODEL_PATH, num_threads=NUM_THREADS)
+            itp.allocate_tensors()
+            _in = itp.get_input_details()[0]   # assume single input
+            _out = itp.get_output_details()[0] # assume first output is logits/probs
+            _interpreter, _in_det, _out_det = itp, _in, _out
+
+    return _interpreter, _in_det, _out_det
+
+# --------------- Helpers ----------------
 def preprocess_image(file_bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     img = img.resize(IMG_SIZE)
@@ -73,22 +92,21 @@ def preprocess_image(file_bytes):
     x = np.expand_dims(x, axis=0)  # [1, H, W, C]
     return img, x
 
-
 def predict_probs(x_batch):
-    xin = x_batch.astype(_in["dtype"])
-    interpreter.set_tensor(_in["index"], xin)
-    interpreter.invoke()
-    preds = interpreter.get_tensor(_out["index"])  # [1, num_classes] usually
+    itp, in_det, out_det = get_interpreter()
+    xin = x_batch.astype(in_det["dtype"])
+    with _interp_lock:
+        itp.set_tensor(in_det["index"], xin)
+        itp.invoke()
+        preds = itp.get_tensor(out_det["index"])  # [1, num_classes]
     preds = preds[0].astype(float)
 
-    # If your TFLite head outputs logits, uncomment softmax below:
+    # If your model outputs logits, uncomment to apply softmax:
     # e = np.exp(preds - np.max(preds))
     # preds = e / np.sum(e)
 
     return preds
-
-
-# ----------------------------
+# ----------------------------------------
 
 @app.get("/health")
 def health():
@@ -97,7 +115,6 @@ def health():
         "model_path": MODEL_PATH,
         "gradcam": GRADCAM_ENABLED
     })
-
 
 @app.post("/predict")
 def predict():
@@ -112,9 +129,11 @@ def predict():
         probs = predict_probs(x)
 
         if len(probs) != len(CLASS_NAMES):
-            return jsonify({"error": "Class count mismatch",
-                            "model_logits": int(len(probs)),
-                            "class_names": int(len(CLASS_NAMES))}), 500
+            return jsonify({
+                "error": "Class count mismatch",
+                "model_logits": int(len(probs)),
+                "class_names": int(len(CLASS_NAMES))
+            }), 500
 
         top_idx = np.argsort(probs)[::-1][:TOP_K]
         top = [{"class": CLASS_NAMES[i], "prob": round(float(probs[i]), 6)} for i in top_idx]
@@ -124,10 +143,9 @@ def predict():
         traceback.print_exc()
         return jsonify({"error": "Internal error", "detail": str(e)}), 500
 
-
 @app.post("/predict_with_gradcam")
 def predict_with_gradcam():
-    # Same as /predict, but keeps the response shape your front-end expects.
+    # Same as /predict, but keeps a 'gradcam_png_base64' key (None for TFLite).
     try:
         if "file" not in request.files:
             return jsonify({"error": "No file part; send multipart/form-data with 'file'"}), 400
@@ -135,32 +153,33 @@ def predict_with_gradcam():
         if not f.filename:
             return jsonify({"error": "Empty filename"}), 400
 
-        base_pil, x = preprocess_image(f.read())
+        _, x = preprocess_image(f.read())
         probs = predict_probs(x)
 
         if len(probs) != len(CLASS_NAMES):
-            return jsonify({"error": "Class count mismatch",
-                            "model_logits": int(len(probs)),
-                            "class_names": int(len(CLASS_NAMES))}), 500
+            return jsonify({
+                "error": "Class count mismatch",
+                "model_logits": int(len(probs)),
+                "class_names": int(len(CLASS_NAMES))
+            }), 500
 
         top_idx = np.argsort(probs)[::-1][:TOP_K]
         top = [{"class": CLASS_NAMES[i], "prob": round(float(probs[i]), 6)} for i in top_idx]
         full = {CLASS_NAMES[i]: round(float(probs[i]), 6) for i in range(len(CLASS_NAMES))}
 
-        resp = {"predicted": top[0]["class"], "top_k": top, "probs": full}
-        # TFLite: no gradients → no CAM image. Keep key for backward-compat, set None.
-        resp["gradcam_png_base64"] = None
-        return jsonify(resp)
+        return jsonify({
+            "predicted": top[0]["class"],
+            "top_k": top,
+            "probs": full,
+            "gradcam_png_base64": None  # not available on TFLite
+        })
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": "Internal error", "detail": str(e)}), 500
 
-
 @app.post("/gradcam")
 def gradcam():
-    # Explicitly 501 so your UI can show a friendly message if you wire it.
     return jsonify({"error": "Grad-CAM is disabled on the TFLite build"}), 501
-
 
 @app.get("/")
 def index():
@@ -219,13 +238,6 @@ def index():
       <h3>Input</h3>
       <img id="preview" alt="uploaded image will preview here" />
     </div>
-
-    {% if gradcam %}
-    <div class="card">
-      <h3>Grad-CAM</h3>
-      <img id="cam" alt="Grad-CAM heatmap will render here" />
-    </div>
-    {% endif %}
   </div>
 
 <script>
@@ -236,17 +248,6 @@ const predsBox = document.getElementById('preds');
 const probsPre = document.getElementById('probs');
 const klist = document.getElementById('klist');
 const preview = document.getElementById('preview');
-{% if gradcam %}
-const cam = document.getElementById('cam');
-const classSelect = document.getElementById('classSelect');
-const btnCam = document.getElementById('btnCam');
-const CLASS_NAMES = {{ class_names | tojson }};
-CLASS_NAMES.forEach((c, i)=> {
-  const opt = document.createElement('option');
-  opt.value = i; opt.textContent = `${i}: ${c}`;
-  classSelect.appendChild(opt);
-});
-{% endif %}
 
 fileInput.addEventListener('change', ()=>{
   const f = fileInput.files[0];
@@ -254,7 +255,6 @@ fileInput.addEventListener('change', ()=>{
   const url = URL.createObjectURL(f);
   preview.src = url;
   predsBox.style.display='none';
-  {% if gradcam %} if (cam) cam.removeAttribute('src'); {% endif %}
 });
 
 form.addEventListener('submit', async (e)=>{
@@ -263,7 +263,6 @@ form.addEventListener('submit', async (e)=>{
   if (!f) return;
 
   statusEl.textContent = 'Uploading & predicting...';
-  {% if gradcam %} if (cam) cam.removeAttribute('src'); {% endif %}
 
   const fd = new FormData();
   fd.append('file', f);
@@ -292,7 +291,7 @@ form.addEventListener('submit', async (e)=>{
 </html>
 """, class_names=CLASS_NAMES, gradcam=GRADCAM_ENABLED)
 
-
 if __name__ == "__main__":
-    # local dev
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # local dev (Render will use gunicorn)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

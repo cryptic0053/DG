@@ -5,6 +5,7 @@ import io
 import urllib.request
 import traceback
 import threading
+import hashlib
 import numpy as np
 from PIL import Image
 from flask import Flask, request, jsonify
@@ -16,7 +17,7 @@ IMG_SIZE   = (224, 224)
 
 # Preprocess used during TRAINING:
 #   "/255"         -> scale to [0,1]
-#   "efficientnet" -> keras.applications.efficientnet.preprocess_input ([-1,1], etc.)
+#   "efficientnet" -> [-1, 1] (equivalent to keras EfficientNet preprocess: x/127.5 - 1.0)
 #   "none"         -> leave 0..255
 PREPROCESS = os.environ.get("PREPROCESS", "/255").lower()
 
@@ -34,7 +35,14 @@ TOP_K = int(os.environ.get("TOP_K", "3"))
 NUM_THREADS = int(os.environ.get("NUM_THREADS", "1"))
 # ===================================================
 
-import tensorflow.lite as tflite
+# ---- TFLite import that works locally & on Render ----
+try:
+    import tensorflow.lite as tflite  # full TF available (local dev)
+    TFLITE_RUNTIME = "tensorflow"
+except Exception:
+    # Render typically has only tflite-runtime installed
+    import tflite_runtime.interpreter as tflite
+    TFLITE_RUNTIME = "tflite-runtime"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8MB uploads
@@ -100,21 +108,23 @@ def _get_qparams(tensor_detail):
     return float(scales[0]), int(zero_points[0] if zero_points else 0)
 
 # --------- Preprocess to match TRAINING ----------
+def _preprocess_array(x: np.ndarray, mode: str) -> np.ndarray:
+    """x is float32 array in range 0..255"""
+    if mode == "efficientnet":
+        # Equivalent to tf.keras.applications.efficientnet.preprocess_input in TF mode
+        # which maps [0,255] -> [-1,1]
+        return (x / 127.5) - 1.0
+    elif mode == "/255":
+        return x / 255.0
+    else:
+        # "none": leave 0..255 float
+        return x
+
 def preprocess_image(file_bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     img = img.resize(IMG_SIZE)
     x = np.asarray(img, dtype=np.float32)
-
-    if PREPROCESS == "efficientnet":
-        # EXACTLY what EfficientNetB0 expects (used during your training)
-        from tensorflow.keras.applications.efficientnet import preprocess_input
-        x = preprocess_input(x)  # -> [-1,1], correct mean/scale
-    elif PREPROCESS == "/255":
-        x = x / 255.0
-    else:
-        # "none": leave 0..255 float
-        pass
-
+    x = _preprocess_array(x, PREPROCESS)
     x = np.expand_dims(x, axis=0)  # (1, H, W, 3)
     return img, x
 
@@ -137,7 +147,6 @@ def predict_probs(x_batch):
     if in_det["dtype"] == np.uint8 or _is_quantized(in_det):
         scale, zp = _get_qparams(in_det)
         if scale == 0.0:
-            # Fallback: clamp to 0..255
             q = np.clip(xin, 0, 255).astype(np.uint8)
         else:
             q = np.round(xin / scale + zp)
@@ -180,7 +189,7 @@ def index():
 @app.get("/healthz")
 def healthz():
     try:
-        itp, in_det, out_det = get_interpreter()
+        get_interpreter()
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
@@ -188,7 +197,7 @@ def healthz():
 @app.get("/debug")
 def debug():
     try:
-        itp, in_det, out_det = get_interpreter()
+        _, in_det, out_det = get_interpreter()
 
         def qinfo(d):
             s = d.get("quantization_parameters", {})
@@ -208,6 +217,7 @@ def debug():
             "img_size": IMG_SIZE,
             "class_names": CLASS_NAMES,
             "model_path": MODEL_PATH,
+            "tflite_runtime": TFLITE_RUNTIME,
         }), 200
     except Exception as e:
         return jsonify({"error": "debug failed", "detail": str(e)}), 500
@@ -247,8 +257,6 @@ def predict_with_gradcam():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": "Internal error", "detail": str(e)}), 500
-    
-import base64
 
 @app.post("/inspect")
 def inspect():
@@ -257,8 +265,10 @@ def inspect():
             return jsonify({"error": "No file provided"}), 400
         f = request.files["file"]
         raw = f.read()
-        _, x = preprocess_image(raw)  # uses current PREPROCESS
-        arr = x.astype("float32")
+        img = Image.open(io.BytesIO(raw)).convert("RGB").resize(IMG_SIZE)
+        arr = np.asarray(img, dtype=np.float32)
+        arr = _preprocess_array(arr, PREPROCESS)
+        arr = np.expand_dims(arr, 0).astype("float32")
         return jsonify({
             "preprocess": PREPROCESS,
             "shape": list(arr.shape),
@@ -270,19 +280,12 @@ def inspect():
         })
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error":"inspect failed","detail":str(e)}), 500
+        return jsonify({"error": "inspect failed", "detail": str(e)}), 500
 
 def _pre_x(raw, mode):
-    # make a local copy of preprocess with override
     img = Image.open(io.BytesIO(raw)).convert("RGB").resize(IMG_SIZE)
     x = np.asarray(img, dtype=np.float32)
-    if mode == "efficientnet":
-        from tensorflow.keras.applications.efficientnet import preprocess_input
-        x = preprocess_input(x)
-    elif mode == "/255":
-        x = x / 255.0
-    elif mode == "none":
-        pass
+    x = _preprocess_array(x, mode)
     return np.expand_dims(x, 0)
 
 @app.post("/triage")
@@ -310,10 +313,7 @@ def triage():
         return jsonify(out)
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error":"triage failed","detail":str(e)}), 500
-
-# --- add to app.py, near other routes ---
-import hashlib
+        return jsonify({"error": "triage failed", "detail": str(e)}), 500
 
 @app.get("/md5")
 def md5sum():
@@ -322,7 +322,6 @@ def md5sum():
         return jsonify({"model_path": MODEL_PATH, "md5": h})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 # ===================== MAIN =====================
 if __name__ == "__main__":
